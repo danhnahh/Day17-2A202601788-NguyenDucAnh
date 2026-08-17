@@ -33,6 +33,7 @@ if str(_ROOT) not in sys.path:
 import streamlit as st
 
 from src.config import settings
+from src.evaluate import find_session, find_user
 from src.llm import gemini_available, generate_reply
 from src.memory_student import StudentMemory
 from src.short_term import ShortTermMemory
@@ -84,31 +85,83 @@ def layer_badge(layer: str) -> str:
     return f'<span class="lab-badge" style="background:{color}">{layer}</span>'
 
 
+def short_term_window(
+    case: dict[str, Any],
+    extra_messages: list[dict[str, str]],
+) -> tuple[str, dict[str, int]]:
+    """Rebuild this case's short-term window, then append the live chat turns.
+
+    Same strategy/params as the benchmark (`src.evaluate.short_term_text`) so the
+    UI reproduces what the report shows. E01 has no `fixture_messages`, so it
+    falls back to the case's own thread in data/sessions.json (minh-s1).
+    """
+    memory = ShortTermMemory(strategy="sliding", max_recent_messages=6, pressure_tokens=450)
+    messages = case.get("fixture_messages")
+    if not messages:
+        try:
+            user = find_user(load_dataset(), case.get("user_id", ""))
+            session = find_session(user, case.get("thread_id", ""))
+            messages = (session or {}).get("messages", [])
+        except KeyError:
+            messages = []
+    for msg in list(messages or []) + list(extra_messages or []):
+        memory.add(msg["role"], msg["content"])
+    return memory.render(), memory.stats()
+
+
 def retrieve_for_case(
     memory: StudentMemory,
     case: dict[str, Any],
     extra_messages: list[dict[str, str]],
 ) -> dict[str, Any]:
-    """BONUS TODO: run student retrieval for the loaded case.
+    """Run student retrieval for the loaded case.
 
-    Return a dict with keys:
-      - "merged_context": str  (StudentMemory.assemble_context output)
-      - "layers": dict[str, str]  (per-layer evidence: short_term/long_term/
-                                   episodic/semantic)
-      - "budget": dict  (the breakdown from assemble_context)
+    Layer selection:
+      * First run on a case -> follow the case's own `expected_layer` /
+        `retrieve_layers`, so the UI mirrors the benchmark result exactly.
+      * Follow-up chat turns (`extra_messages` non-empty) -> query ALL durable
+        layers, because a free-form question is not bound to the case's layer.
 
-    Hints:
-      * Build short_term from case["fixture_messages"] if present, else from
-        the matching user/thread messages in data/sessions.json, plus
-        extra_messages. E01 has no fixture — it uses thread minh-s1.
-      * Decide which durable layers to fetch from case["expected_layer"] (or
-        case["retrieve_layers"] for "mixed"), then call
-        memory.retrieve_long_term / retrieve_episodic / retrieve_semantic.
-      * Keep user_id and thread_id from the loaded case.
-      * Finish with memory.assemble_context(layers).
+    Short-term is always included: it *is* the conversation history.
+
+    Note: `retrieve_long_term` calls `prime_eval_thread`, which recreates the
+    thread on Zep. The durable user graph is untouched, and the visible history
+    lives in `st.session_state.chat`, so repeated calls stay safe.
     """
-    _ = (memory, case, extra_messages, settings, ShortTermMemory)
-    raise NotImplementedError("BONUS TODO: run student retrieval for the loaded case")
+    query = case.get("query", "")
+    expected = case.get("expected_layer", "mixed")
+
+    if extra_messages:
+        wanted = ["long_term", "episodic", "semantic"]
+    elif expected == "mixed":
+        wanted = list(case.get("retrieve_layers") or ["long_term", "semantic"])
+    elif expected == "short_term":
+        wanted = []
+    else:
+        wanted = [expected]
+
+    user_id = case.get("user_id", "")
+    thread_id = case.get("thread_id", "")
+
+    layers = {"short_term": "", "long_term": "", "episodic": "", "semantic": ""}
+    layers["short_term"], short_stats = short_term_window(case, extra_messages)
+
+    if "long_term" in wanted and user_id and thread_id:
+        layers["long_term"] = memory.retrieve_long_term(
+            user_id=user_id, thread_id=thread_id, query=query
+        )
+    if "episodic" in wanted and user_id:
+        layers["episodic"] = memory.retrieve_episodic(user_id, query)
+    if "semantic" in wanted:
+        layers["semantic"] = memory.retrieve_semantic(settings.semantic_graph_id, query)
+
+    merged_context, budget = memory.assemble_context(layers)
+    return {
+        "merged_context": merged_context,
+        "layers": layers,
+        "budget": budget,
+        "short_term_stats": short_stats,
+    }
 
 
 def main() -> None:
